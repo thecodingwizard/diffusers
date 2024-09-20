@@ -18,7 +18,7 @@ from typing import Callable, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
-from flash_attn import flash_attn_func
+from flash_attn_interface import flash_attn_func
 
 from ..image_processor import IPAdapterMaskProcessor
 from ..utils import deprecate, logging
@@ -1703,7 +1703,7 @@ torch.library.define(
 
 @torch.library.impl("mylib::custom_func", "cuda")
 def custom_func(q, k, v):
-    hidden_states = flash_attn_func(q, k, v)
+    hidden_states, _ = flash_attn_func(q, k, v)
     return hidden_states
 
 @torch.library.register_fake("mylib::custom_func")
