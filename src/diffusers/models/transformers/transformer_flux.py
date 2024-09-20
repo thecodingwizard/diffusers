@@ -40,6 +40,8 @@ from ..modeling_outputs import Transformer2DModelOutput
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
+
+
 @maybe_allow_in_graph
 class FluxSingleTransformerBlock(nn.Module):
     r"""
@@ -84,6 +86,9 @@ class FluxSingleTransformerBlock(nn.Module):
         temb: torch.FloatTensor,
         image_rotary_emb=None,
     ):
+        # start = torch.cuda.Event(enable_timing=True)
+        # end = torch.cuda.Event(enable_timing=True)
+        # start.record()
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
         mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
@@ -99,6 +104,9 @@ class FluxSingleTransformerBlock(nn.Module):
         hidden_states = residual + hidden_states
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
+        # end.record()
+        # torch.cuda.synchronize()
+        # print(start.elapsed_time(end))
 
         return hidden_states
 

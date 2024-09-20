@@ -18,6 +18,7 @@ from typing import Callable, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
+from flash_attn import flash_attn_func
 
 from ..image_processor import IPAdapterMaskProcessor
 from ..utils import deprecate, logging
@@ -1695,6 +1696,21 @@ class FusedAuraFlowAttnProcessor2_0:
             return hidden_states
 
 
+torch.library.define(
+    "mylib::custom_func",
+    "(Tensor q, Tensor k, Tensor v) -> Tensor",
+)
+
+@torch.library.impl("mylib::custom_func", "cuda")
+def custom_func(q, k, v):
+    hidden_states = flash_attn_func(q, k, v)
+    return hidden_states
+
+@torch.library.register_fake("mylib::custom_func")
+def custom_func_abstract(q, k, v):
+    return torch.empty_like(q)
+
+
 class FluxAttnProcessor2_0:
     """Attention processor used typically in processing the SD3-like self-attention projections."""
 
@@ -1725,7 +1741,7 @@ class FluxAttnProcessor2_0:
         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
         if attn.norm_q is not None:
-            query = attn.norm_q(query)
+            query = attn.norm_q(query) # rms norm
         if attn.norm_k is not None:
             key = attn.norm_k(key)
 
@@ -1759,11 +1775,16 @@ class FluxAttnProcessor2_0:
         if image_rotary_emb is not None:
             from .embeddings import apply_rotary_emb
 
+            # note: this prohibits us from avoiding transposing. IDK if this matters though.
             query = apply_rotary_emb(query, image_rotary_emb)
             key = apply_rotary_emb(key, image_rotary_emb)
 
-        hidden_states = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        # hidden_states = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
+        # hidden_states, _ = flash_attn_interface.flash_attn_func(query.transpose(1, 2), key.transpose(1, 2), value)
+        # hidden_states = hidden_states.transpose(1, 2)
+        hidden_states = torch.ops.mylib.custom_func(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2))
+        # hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
 
         if encoder_hidden_states is not None:
@@ -1781,6 +1802,17 @@ class FluxAttnProcessor2_0:
             return hidden_states, encoder_hidden_states
         else:
             return hidden_states
+
+
+"""
+Q = N, H, L, D
+K = N, H, L, D
+V = N, H, L, D
+Q @ K^T = N, H, L, L
+Q @ K^T @ V = N, H, L, D
+transpose: N, L, H, D
+view: N, L, D'
+"""
 
 
 class FusedFluxAttnProcessor2_0:
@@ -1856,8 +1888,12 @@ class FusedFluxAttnProcessor2_0:
             query = apply_rotary_emb(query, image_rotary_emb)
             key = apply_rotary_emb(key, image_rotary_emb)
 
-        hidden_states = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        # hidden_states = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
+        # hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+
+        hidden_states = torch.ops.mylib.custom_func(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2))
+        hidden_states = hidden_states.reshape(batch_size, -1, attn.heads * head_dim)
+
         hidden_states = hidden_states.to(query.dtype)
 
         if encoder_hidden_states is not None:
