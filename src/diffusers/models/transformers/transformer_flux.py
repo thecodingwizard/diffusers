@@ -19,6 +19,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import gemm_mod_bf16
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import FromOriginalModelMixin, PeftAdapterMixin
@@ -221,9 +222,12 @@ class FluxSingleTransformerBlock(nn.Module):
         attn_out = attn_and_mlp_out[:,:,:3072]
         mlp_out = attn_and_mlp_out[:,:,3072:]
 
-        torch.matmul(norm_hidden_states, self.proj_mlp.weight.T, out=mlp_out)
-        mlp_out_tmp = torch.nn.functional.gelu(mlp_out, approximate="tanh") # warning: not in place
-        mlp_out.copy_(mlp_out_tmp) # temporary
+        gemm_mod_bf16.run_aten(norm_hidden_states.squeeze(0), self.proj_mlp.weight.T, mlp_out.squeeze(0), self.proj_mlp.bias)
+
+        # torch.matmul(norm_hidden_states, self.proj_mlp.weight.T, out=mlp_out)
+        # mlp_out.add_(self.proj_mlp.bias)
+        # mlp_out_tmp = torch.nn.functional.gelu(mlp_out, approximate="tanh") # warning: not in place
+        # mlp_out.copy_(mlp_out_tmp) # temporary
 
         triton_attn.my_attention(norm_hidden_states, image_rotary_emb, out=attn_out, to_qkv=self.attn.to_qkv, norm_q = self.attn.norm_q, norm_k = self.attn.norm_k)
         # attn_out = self.attn(
