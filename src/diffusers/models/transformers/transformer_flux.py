@@ -239,7 +239,7 @@ class FluxSingleTransformerBlock(nn.Module):
         # )
 
         gate = gate.unsqueeze(1)
-        hidden_states = self.fuse_residual(self.proj_out(attn_and_mlp_out), gate, hidden_states)
+        hidden_states = self.fuse_residual(self.proj_out(attn_and_mlp_out), gate, residual)
         # hidden_states = gate * self.proj_out(attn_and_mlp_out)
         # hidden_states = residual + hidden_states
 
