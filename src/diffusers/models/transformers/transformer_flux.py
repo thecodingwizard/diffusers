@@ -41,6 +41,7 @@ import triton
 import triton.language as tl
 from triton.language.extra.libdevice import rsqrt
 import triton_attn
+import triton_gelu_copy
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -222,12 +223,14 @@ class FluxSingleTransformerBlock(nn.Module):
         attn_out = attn_and_mlp_out[:,:,:3072]
         mlp_out = attn_and_mlp_out[:,:,3072:]
 
-        gemm_mod_bf16.run_aten(norm_hidden_states.squeeze(0), self.proj_mlp.weight.T, mlp_out.squeeze(0), self.proj_mlp.bias)
+        # gemm_mod_bf16.run_aten(norm_hidden_states.squeeze(0), self.proj_mlp.weight.T, mlp_out.squeeze(0), self.proj_mlp.bias)
 
-        # torch.matmul(norm_hidden_states, self.proj_mlp.weight.T, out=mlp_out)
+        # gemm_mod_bf16.run(norm_hidden_states, self.proj_mlp.weight, mlp_out)
         # mlp_out.add_(self.proj_mlp.bias)
         # mlp_out_tmp = torch.nn.functional.gelu(mlp_out, approximate="tanh") # warning: not in place
         # mlp_out.copy_(mlp_out_tmp) # temporary
+        mlp_hidden_states = self.proj_mlp(norm_hidden_states)
+        triton_gelu_copy.gelu_and_copy(mlp_hidden_states, mlp_out)
 
         triton_attn.my_attention(norm_hidden_states, image_rotary_emb, out=attn_out, to_qkv=self.attn.to_qkv, norm_q = self.attn.norm_q, norm_k = self.attn.norm_k)
         # attn_out = self.attn(
@@ -352,6 +355,7 @@ class FluxTransformerBlock(nn.Module):
         self._chunk_size = None
         self._chunk_dim = 0
 
+    @torch.compile
     def forward(
         self,
         hidden_states: torch.FloatTensor,
