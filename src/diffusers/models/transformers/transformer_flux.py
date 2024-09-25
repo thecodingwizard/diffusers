@@ -39,8 +39,8 @@ from ..modeling_outputs import Transformer2DModelOutput
 import triton
 import triton.language as tl
 from triton.language.extra.libdevice import rsqrt
-import triton_attn
-import triton_gelu_copy
+from . import triton_attn
+from . import triton_gelu_copy
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
