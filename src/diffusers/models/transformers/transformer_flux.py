@@ -239,10 +239,18 @@ class FluxSingleTransformerBlock(nn.Module):
         # )
 
         gate = gate.unsqueeze(1)
-        hidden_states = gate * self.proj_out(attn_and_mlp_out)
-        hidden_states = residual + hidden_states
+        hidden_states = self.fuse_residual(self.proj_out(attn_and_mlp_out), gate, hidden_states)
+        # hidden_states = gate * self.proj_out(attn_and_mlp_out)
+        # hidden_states = residual + hidden_states
 
         return hidden_states
+
+
+    @torch.compile
+    def fuse_residual(self, proj_out, gate, hidden_states):
+        return gate * proj_out + hidden_states
+
+
 
 # @maybe_allow_in_graph
 # class FluxSingleTransformerBlock(nn.Module):
