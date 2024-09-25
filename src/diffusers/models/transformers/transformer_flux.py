@@ -19,7 +19,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import gemm_mod_bf16
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import FromOriginalModelMixin, PeftAdapterMixin
