@@ -30,7 +30,7 @@ from ...models.attention_processor import (
     FusedFluxAttnProcessor2_0,
 )
 from ...models.modeling_utils import ModelMixin
-from ...models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
+from ...models.normalization import AdaLayerNormContinuous, AdaLayerNormZero
 from ...utils import USE_PEFT_BACKEND, is_torch_version, logging, scale_lora_layers, unscale_lora_layers
 from ...utils.torch_utils import maybe_allow_in_graph
 from ..embeddings import CombinedTimestepGuidanceTextProjEmbeddings, CombinedTimestepTextProjEmbeddings, FluxPosEmbed
@@ -39,6 +39,7 @@ from ..modeling_outputs import Transformer2DModelOutput
 import triton
 import triton.language as tl
 from triton.language.extra.libdevice import rsqrt
+import triton_attn
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -107,7 +108,7 @@ def _modulation_kernel(
 
 
 
-class AdaLayerNormZeroSingle2(nn.Module):
+class AdaLayerNormZeroSingle(nn.Module):
     r"""
     Norm layer adaptive layer norm zero (adaLN-Zero).
 
@@ -168,128 +169,6 @@ class AdaLayerNormZeroSingle2(nn.Module):
         )
         return self.actual_out, gate_msa
 
-@triton.autotune(
-  configs=[
-    triton.Config(kwargs={}, num_warps=1),
-    triton.Config(kwargs={}, num_warps=2),
-    triton.Config(kwargs={}, num_warps=4),
-    triton.Config(kwargs={}, num_warps=8),
-  ],
-  key=[]
-)
-@triton.jit
-def _fused_qkv_rmsnorm_embed(
-    X_ptr,
-    X_stride_1,
-    X_stride_2,
-    W_q_ptr,
-    W_k_ptr,
-    eps,
-
-    freq_cos_ptr,
-    freq_sin_ptr, # assumed to be contiguous. [4224, 128]
-):
-    """
-    y_i = (x_i / (RMS)) * (offset + wi), RMS = sqrt(sum(x_i^2) / N)
-
-    Reference:
-    1. https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html
-    2. https://github.com/unslothai/unsloth/blob/fd753fed99ed5f10ef8a9b7139588d9de9ddecfb/unsloth/kernels/rms_layernorm.py#L22
-    3. https://arxiv.org/pdf/1910.07467
-    """
-
-    n_heads: tl.constexpr = 24 * 2 # query, then key
-    head_dim: tl.constexpr = 128
-
-    row_idx = tl.program_id(0)
-    col_offsets = tl.arange(0, head_dim)
-    mask = col_offsets < head_dim
-
-    X_ptr += row_idx * X_stride_1
-    W_q_row = tl.load(W_q_ptr + col_offsets, mask=mask, other=0)
-    W_q_row = W_q_row.to(tl.float32)
-    W_k_row = tl.load(W_k_ptr + col_offsets, mask=mask, other=0)
-    W_k_row = W_k_row.to(tl.float32)
-
-    cos_first_half = tl.load(freq_cos_ptr + row_idx * 128 + tl.arange(0, head_dim // 2) * 2).to(tl.float32)
-    cos_second_half = tl.load(freq_cos_ptr + row_idx * 128 + tl.arange(0, head_dim // 2) * 2 + 1).to(tl.float32)
-
-    sin_first_half = tl.load(freq_sin_ptr + row_idx * 128 + tl.arange(0, head_dim // 2) * 2).to(tl.float32) * -1
-    sin_second_half = tl.load(freq_sin_ptr + row_idx * 128 + tl.arange(0, head_dim // 2) * 2 + 1).to(tl.float32)
-
-    for i in range(n_heads):
-        X_row = tl.load(X_ptr + i * X_stride_2 + col_offsets, mask=mask, other=0)
-        X_row = X_row.to(tl.float32)
-
-        mean_square = tl.sum(X_row * X_row, axis=0) / head_dim
-        rstd = rsqrt(mean_square + eps)
-
-        X_row = X_row * rstd
-
-        # lol ugh apparently llama does this calculation in bf16, but maybe f32 is OK?
-        # X_row = X_row.to(tl.bfloat16)
-        Y_row = X_row * (W_q_row if i < 24 else W_k_row)
-
-        # tl.store(X_ptr + i * X_stride_2 + tl.arange(0, 128), Y_row.to(tl.float16))
-        # --- ^ end RMS norm
-        # --- v begin rope
-        # Y_row is [1, 128] right now
-        # X is [(B S) H D]. one program ID corresponds to one of (B S)
-        # cos, sin = freqs_cis  # [S, D]
-        # x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)  # [B, S, H, D//2]
-        # x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
-        # out = (x.float() * cos[None,:,None,:] + x_rotated.float() * sin[None,:,None,:]).to(x.dtype)
-
-        Y_real, Y_imag = Y_row.reshape(64, 2).split()
-
-        Y_first_half = Y_real * cos_first_half + Y_imag * sin_first_half
-        Y_second_half = Y_imag * cos_second_half + Y_real * sin_second_half
-        tl.store(X_ptr + i * X_stride_2 + tl.arange(0, head_dim//2) * 2, Y_first_half.to(tl.bfloat16))
-        tl.store(X_ptr + i * X_stride_2 + tl.arange(0, head_dim//2) * 2 + 1, Y_second_half.to(tl.bfloat16))
-
-
-# @torch.compile
-def my_attention(
-    hidden_states: torch.FloatTensor,
-    image_rotary_emb: Tuple[torch.Tensor],
-    to_qkv,
-    norm_q,
-    norm_k,
-) -> torch.FloatTensor:
-    batch_size, _, _ = hidden_states.shape
-
-    # `sample` projections.
-    qkv = to_qkv(hidden_states)
-    split_size = qkv.shape[-1] // 3
-    query, key, value = torch.split(qkv, split_size, dim=-1)
-
-    inner_dim = key.shape[-1]
-    # n_heads = 24
-    head_dim = inner_dim // 24
-
-    query = query.view(-1, 24, head_dim)
-    key = key.view(-1, 24, head_dim)
-
-    _fused_qkv_rmsnorm_embed[(query.shape[0],)](
-        query,
-        query.stride(0),
-        query.stride(1),
-        norm_q,
-        norm_k,
-        1e-6,
-        image_rotary_emb[0],
-        image_rotary_emb[1],
-    )
-
-    # [B, S, H, D]
-    query = query.view(batch_size, -1, 24, head_dim)
-    key = key.view(batch_size, -1, 24, head_dim)
-    value = value.view(batch_size, -1, 24, head_dim)
-
-    hidden_states = torch.ops.mylib.custom_func(query, key, value)
-    hidden_states = hidden_states.reshape(batch_size, -1, 24 * head_dim)
-
-    return hidden_states
 
 @maybe_allow_in_graph
 class FluxSingleTransformerBlock(nn.Module):
@@ -310,7 +189,7 @@ class FluxSingleTransformerBlock(nn.Module):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
-        self.norm = AdaLayerNormZeroSingle2(dim)
+        self.norm = AdaLayerNormZeroSingle(dim)
         self.proj_mlp = nn.Linear(dim, self.mlp_hidden_dim)
         self.act_mlp = nn.GELU(approximate="tanh")
         self.proj_out = nn.Linear(dim + self.mlp_hidden_dim, dim)
@@ -337,19 +216,85 @@ class FluxSingleTransformerBlock(nn.Module):
     ):
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
-        mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
 
-        attn_output = my_attention(norm_hidden_states, image_rotary_emb, self.attn.to_qkv, self.attn.norm_q.weight, self.attn.norm_k.weight)
+        attn_and_mlp_out = torch.empty((1, 4224, 3072 + 3072 * 4), dtype=torch.bfloat16, device="cuda")
+        attn_out = attn_and_mlp_out[:,:,:3072]
+        mlp_out = attn_and_mlp_out[:,:,3072:]
 
-        hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
+        torch.matmul(norm_hidden_states, self.proj_mlp.weight.T, out=mlp_out)
+        mlp_out_tmp = torch.nn.functional.gelu(mlp_out, approximate="tanh") # warning: not in place
+        mlp_out.copy_(mlp_out_tmp) # temporary
+
+        triton_attn.my_attention(norm_hidden_states, image_rotary_emb, out=attn_out, to_qkv=self.attn.to_qkv, norm_q = self.attn.norm_q, norm_k = self.attn.norm_k)
+        # attn_out = self.attn(
+        #     hidden_states=norm_hidden_states,
+        #     image_rotary_emb=image_rotary_emb
+        # )
+
         gate = gate.unsqueeze(1)
-        hidden_states = gate * self.proj_out(hidden_states)
+        hidden_states = gate * self.proj_out(attn_and_mlp_out)
         hidden_states = residual + hidden_states
-        if hidden_states.dtype == torch.float16:
-            hidden_states = hidden_states.clip(-65504, 65504)
 
         return hidden_states
 
+# @maybe_allow_in_graph
+# class FluxSingleTransformerBlock(nn.Module):
+#     r"""
+#     A Transformer block following the MMDiT architecture, introduced in Stable Diffusion 3.
+
+#     Reference: https://arxiv.org/abs/2403.03206
+
+#     Parameters:
+#         dim (`int`): The number of channels in the input and output.
+#         num_attention_heads (`int`): The number of heads to use for multi-head attention.
+#         attention_head_dim (`int`): The number of channels in each head.
+#         context_pre_only (`bool`): Boolean to determine if we should add some blocks associated with the
+#             processing of `context` conditions.
+#     """
+
+#     def __init__(self, dim, num_attention_heads, attention_head_dim, mlp_ratio=4.0):
+#         super().__init__()
+#         self.mlp_hidden_dim = int(dim * mlp_ratio)
+
+#         self.norm = AdaLayerNormZeroSingle(dim)
+#         self.proj_mlp = nn.Linear(dim, self.mlp_hidden_dim)
+#         self.act_mlp = nn.GELU(approximate="tanh")
+#         self.proj_out = nn.Linear(dim + self.mlp_hidden_dim, dim)
+
+#         processor = FluxAttnProcessor2_0()
+#         self.attn = Attention(
+#             query_dim=dim,
+#             cross_attention_dim=None,
+#             dim_head=attention_head_dim,
+#             heads=num_attention_heads,
+#             out_dim=dim,
+#             bias=True,
+#             processor=processor,
+#             qk_norm="rms_norm",
+#             eps=1e-6,
+#             pre_only=True,
+#         )
+
+#     def forward(
+#         self,
+#         hidden_states: torch.FloatTensor,
+#         temb: torch.FloatTensor,
+#         image_rotary_emb=None,
+#     ):
+#         residual = hidden_states
+#         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
+#         mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
+
+#         attn_output = my_attention(norm_hidden_states, image_rotary_emb, self.attn.to_qkv, self.attn.norm_q.weight, self.attn.norm_k.weight)
+
+#         hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
+#         gate = gate.unsqueeze(1)
+#         hidden_states = gate * self.proj_out(hidden_states)
+#         hidden_states = residual + hidden_states
+#         if hidden_states.dtype == torch.float16:
+#             hidden_states = hidden_states.clip(-65504, 65504)
+
+#         return hidden_states
 
 @maybe_allow_in_graph
 class FluxTransformerBlock(nn.Module):
