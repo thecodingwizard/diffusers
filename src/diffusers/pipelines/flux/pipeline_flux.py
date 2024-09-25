@@ -726,6 +726,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
                     img_ids=latent_image_ids,
                     joint_attention_kwargs=self.joint_attention_kwargs,
                     return_dict=False,
+                    profile=guidance == 3.51
                 )[0]
 
                 # compute the previous noisy sample x_t -> x_t-1

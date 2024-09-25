@@ -36,11 +36,260 @@ from ...utils.torch_utils import maybe_allow_in_graph
 from ..embeddings import CombinedTimestepGuidanceTextProjEmbeddings, CombinedTimestepTextProjEmbeddings, FluxPosEmbed
 from ..modeling_outputs import Transformer2DModelOutput
 
+import triton
+import triton.language as tl
+from triton.language.extra.libdevice import rsqrt
+
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 
+@triton.jit
+def _layer_norm_forward_kernel(
+    X_ptr,
+    X_stride,
+    Y_ptr,
+    Y_stride,
+    shift_msa,
+    scale_msa,
+    n_cols,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    References:
+    https://arxiv.org/abs/1607.06450
+    https://github.com/karpathy/llm.c/blob/master/doc/layernorm/layernorm.md
+    """
+    row_idx = tl.program_id(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < n_cols
+
+    X_ptr += row_idx * X_stride
+
+    X_row = tl.load(X_ptr + col_offsets, mask=mask, other=0).to(tl.float32)
+    mean = tl.sum(X_row, axis=0) / n_cols
+    var = tl.sum((X_row - mean) * (X_row - mean), axis=0) / n_cols
+    rstd = rsqrt(var + eps)
+
+    shift = tl.load(shift_msa + col_offsets, mask=mask, other=0).to(tl.float32)
+    scale = tl.load(scale_msa + col_offsets, mask=mask, other=0).to(tl.float32)
+
+    Y_row = (X_row - mean) * rstd
+    Y_row = Y_row * (1.0 + scale) + shift
+    tl.store(Y_ptr + col_offsets + row_idx * Y_stride, Y_row.to(tl.bfloat16), mask=mask)
+
+@triton.jit
+def _modulation_kernel(
+    embed_ptr,
+    weight_ptr,
+    bias_ptr,
+    out_ptr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    col_idx = tl.program_id(0)
+
+    weight_ptr += col_idx * 3072
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < 3072
+
+    embed = tl.load(embed_ptr + offsets, mask=mask).to(tl.float32)
+
+    sigmoid_x = 1 / (1 + tl.exp(-embed))
+    embed_after_silu = embed * sigmoid_x
+
+    weight = tl.load(weight_ptr + offsets, mask=mask).to(tl.float32)
+    bias = tl.load(bias_ptr + col_idx).to(tl.float32)
+
+    out = tl.sum(embed_after_silu * weight) + bias
+    tl.store(out_ptr + col_idx, out.to(tl.bfloat16))
+
+
+
+class AdaLayerNormZeroSingle2(nn.Module):
+    r"""
+    Norm layer adaptive layer norm zero (adaLN-Zero).
+
+    Parameters:
+        embedding_dim (`int`): The size of each embedding vector.
+        num_embeddings (`int`): The size of the embeddings dictionary.
+
+    
+    optimized: 2160.682373046875us, 2167.112548828125us
+    unoptimized: 2191.817138671875us, 2200.03515625us
+    """
+
+    def __init__(self, embedding_dim: int, norm_type="layer_norm", bias=True):
+        super().__init__()
+
+        self.silu = nn.SiLU()
+        self.linear = nn.Linear(embedding_dim, 3 * embedding_dim, bias=bias)
+        if norm_type == "layer_norm":
+            self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
+        else:
+            raise ValueError(
+                f"Unsupported `norm_type` ({norm_type}) provided. Supported ones are: 'layer_norm', 'fp32_layer_norm'."
+            )
+
+        self.emb_out = torch.empty((1, 3072*3), dtype=torch.bfloat16, device="cuda")
+        self.actual_out = torch.empty((1, 4224, 3072), dtype=torch.bfloat16, device="cuda")
+
+    # @torch.compiler.disable
+    def forward(
+        self,
+        x: torch.Tensor,
+        emb: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        _modulation_kernel[(3072*3,)](
+            emb,
+            self.linear.weight,
+            self.linear.bias,
+            self.emb_out,
+            BLOCK_SIZE=4096,
+            num_warps=8,
+        )
+
+        shift_msa, scale_msa, gate_msa = self.emb_out.chunk(3, dim=1)
+
+        n_rows = x.shape[1]
+        dim = x.shape[-1]
+        _layer_norm_forward_kernel[(n_rows,)](
+            x,
+            x.stride(1), # since first dimension is empty
+            self.actual_out,
+            self.actual_out.stride(1), # since first dimension is empty
+            shift_msa,
+            scale_msa,
+            dim,
+            eps=1e-6,
+            BLOCK_SIZE=4096, # https://github.com/linkedin/Liger-Kernel/blob/main/src/liger_kernel/ops/utils.py
+            num_warps=8,
+        )
+        return self.actual_out, gate_msa
+
+@triton.autotune(
+  configs=[
+    triton.Config(kwargs={}, num_warps=1),
+    triton.Config(kwargs={}, num_warps=2),
+    triton.Config(kwargs={}, num_warps=4),
+    triton.Config(kwargs={}, num_warps=8),
+  ],
+  key=[]
+)
+@triton.jit
+def _fused_qkv_rmsnorm_embed(
+    X_ptr,
+    X_stride_1,
+    X_stride_2,
+    W_q_ptr,
+    W_k_ptr,
+    eps,
+
+    freq_cos_ptr,
+    freq_sin_ptr, # assumed to be contiguous. [4224, 128]
+):
+    """
+    y_i = (x_i / (RMS)) * (offset + wi), RMS = sqrt(sum(x_i^2) / N)
+
+    Reference:
+    1. https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html
+    2. https://github.com/unslothai/unsloth/blob/fd753fed99ed5f10ef8a9b7139588d9de9ddecfb/unsloth/kernels/rms_layernorm.py#L22
+    3. https://arxiv.org/pdf/1910.07467
+    """
+
+    n_heads: tl.constexpr = 24 * 2 # query, then key
+    head_dim: tl.constexpr = 128
+
+    row_idx = tl.program_id(0)
+    col_offsets = tl.arange(0, head_dim)
+    mask = col_offsets < head_dim
+
+    X_ptr += row_idx * X_stride_1
+    W_q_row = tl.load(W_q_ptr + col_offsets, mask=mask, other=0)
+    W_q_row = W_q_row.to(tl.float32)
+    W_k_row = tl.load(W_k_ptr + col_offsets, mask=mask, other=0)
+    W_k_row = W_k_row.to(tl.float32)
+
+    cos_first_half = tl.load(freq_cos_ptr + row_idx * 128 + tl.arange(0, head_dim // 2) * 2).to(tl.float32)
+    cos_second_half = tl.load(freq_cos_ptr + row_idx * 128 + tl.arange(0, head_dim // 2) * 2 + 1).to(tl.float32)
+
+    sin_first_half = tl.load(freq_sin_ptr + row_idx * 128 + tl.arange(0, head_dim // 2) * 2).to(tl.float32) * -1
+    sin_second_half = tl.load(freq_sin_ptr + row_idx * 128 + tl.arange(0, head_dim // 2) * 2 + 1).to(tl.float32)
+
+    for i in range(n_heads):
+        X_row = tl.load(X_ptr + i * X_stride_2 + col_offsets, mask=mask, other=0)
+        X_row = X_row.to(tl.float32)
+
+        mean_square = tl.sum(X_row * X_row, axis=0) / head_dim
+        rstd = rsqrt(mean_square + eps)
+
+        X_row = X_row * rstd
+
+        # lol ugh apparently llama does this calculation in bf16, but maybe f32 is OK?
+        # X_row = X_row.to(tl.bfloat16)
+        Y_row = X_row * (W_q_row if i < 24 else W_k_row)
+
+        # tl.store(X_ptr + i * X_stride_2 + tl.arange(0, 128), Y_row.to(tl.float16))
+        # --- ^ end RMS norm
+        # --- v begin rope
+        # Y_row is [1, 128] right now
+        # X is [(B S) H D]. one program ID corresponds to one of (B S)
+        # cos, sin = freqs_cis  # [S, D]
+        # x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)  # [B, S, H, D//2]
+        # x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
+        # out = (x.float() * cos[None,:,None,:] + x_rotated.float() * sin[None,:,None,:]).to(x.dtype)
+
+        Y_real, Y_imag = Y_row.reshape(64, 2).split()
+
+        Y_first_half = Y_real * cos_first_half + Y_imag * sin_first_half
+        Y_second_half = Y_imag * cos_second_half + Y_real * sin_second_half
+        tl.store(X_ptr + i * X_stride_2 + tl.arange(0, head_dim//2) * 2, Y_first_half.to(tl.bfloat16))
+        tl.store(X_ptr + i * X_stride_2 + tl.arange(0, head_dim//2) * 2 + 1, Y_second_half.to(tl.bfloat16))
+
+
+# @torch.compile
+def my_attention(
+    hidden_states: torch.FloatTensor,
+    image_rotary_emb: Tuple[torch.Tensor],
+    to_qkv,
+    norm_q,
+    norm_k,
+) -> torch.FloatTensor:
+    batch_size, _, _ = hidden_states.shape
+
+    # `sample` projections.
+    qkv = to_qkv(hidden_states)
+    split_size = qkv.shape[-1] // 3
+    query, key, value = torch.split(qkv, split_size, dim=-1)
+
+    inner_dim = key.shape[-1]
+    # n_heads = 24
+    head_dim = inner_dim // 24
+
+    query = query.view(-1, 24, head_dim)
+    key = key.view(-1, 24, head_dim)
+
+    _fused_qkv_rmsnorm_embed[(query.shape[0],)](
+        query,
+        query.stride(0),
+        query.stride(1),
+        norm_q,
+        norm_k,
+        1e-6,
+        image_rotary_emb[0],
+        image_rotary_emb[1],
+    )
+
+    # [B, S, H, D]
+    query = query.view(batch_size, -1, 24, head_dim)
+    key = key.view(batch_size, -1, 24, head_dim)
+    value = value.view(batch_size, -1, 24, head_dim)
+
+    hidden_states = torch.ops.mylib.custom_func(query, key, value)
+    hidden_states = hidden_states.reshape(batch_size, -1, 24 * head_dim)
+
+    return hidden_states
 
 @maybe_allow_in_graph
 class FluxSingleTransformerBlock(nn.Module):
@@ -61,7 +310,7 @@ class FluxSingleTransformerBlock(nn.Module):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
-        self.norm = AdaLayerNormZeroSingle(dim)
+        self.norm = AdaLayerNormZeroSingle2(dim)
         self.proj_mlp = nn.Linear(dim, self.mlp_hidden_dim)
         self.act_mlp = nn.GELU(approximate="tanh")
         self.proj_out = nn.Linear(dim + self.mlp_hidden_dim, dim)
@@ -86,17 +335,11 @@ class FluxSingleTransformerBlock(nn.Module):
         temb: torch.FloatTensor,
         image_rotary_emb=None,
     ):
-        # start = torch.cuda.Event(enable_timing=True)
-        # end = torch.cuda.Event(enable_timing=True)
-        # start.record()
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
         mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
 
-        attn_output = self.attn(
-            hidden_states=norm_hidden_states,
-            image_rotary_emb=image_rotary_emb,
-        )
+        attn_output = my_attention(norm_hidden_states, image_rotary_emb, self.attn.to_qkv, self.attn.norm_q.weight, self.attn.norm_k.weight)
 
         hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
         gate = gate.unsqueeze(1)
@@ -104,9 +347,6 @@ class FluxSingleTransformerBlock(nn.Module):
         hidden_states = residual + hidden_states
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
-        # end.record()
-        # torch.cuda.synchronize()
-        # print(start.elapsed_time(end))
 
         return hidden_states
 
@@ -406,6 +646,7 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         controlnet_block_samples=None,
         controlnet_single_block_samples=None,
         return_dict: bool = True,
+        profile=False
     ) -> Union[torch.FloatTensor, Transformer2DModelOutput]:
         """
         The [`FluxTransformer2DModel`] forward method.
@@ -413,6 +654,7 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         Args:
             hidden_states (`torch.FloatTensor` of shape `(batch size, channel, height, width)`):
                 Input `hidden_states`.
+                Actually, I think this is batch x # patches x # channels?
             encoder_hidden_states (`torch.FloatTensor` of shape `(batch size, sequence_len, embed_dims)`):
                 Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
             pooled_projections (`torch.FloatTensor` of shape `(batch_size, projection_dim)`): Embeddings projected
