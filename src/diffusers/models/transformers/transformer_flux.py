@@ -228,10 +228,11 @@ class FluxSingleTransformerBlock(nn.Module):
         # mlp_out.add_(self.proj_mlp.bias)
         # mlp_out_tmp = torch.nn.functional.gelu(mlp_out, approximate="tanh") # warning: not in place
         # mlp_out.copy_(mlp_out_tmp) # temporary
-        mlp_hidden_states = self.proj_mlp(norm_hidden_states)
+        qkv_mlp = self.qkv_mlp_linear(norm_hidden_states)
+        qkv, mlp_hidden_states = torch.split(qkv_mlp, [3 * 3072, self.mlp_hidden_dim], dim=-1)
         triton_gelu_copy.gelu_and_copy(mlp_hidden_states, mlp_out)
 
-        triton_attn.my_attention(norm_hidden_states, image_rotary_emb, out=attn_out, to_qkv=self.attn.to_qkv, norm_q = self.attn.norm_q, norm_k = self.attn.norm_k)
+        triton_attn.my_attention(norm_hidden_states, image_rotary_emb, out=attn_out, qkv=qkv, norm_q = self.attn.norm_q, norm_k = self.attn.norm_k)
         # attn_out = self.attn(
         #     hidden_states=norm_hidden_states,
         #     image_rotary_emb=image_rotary_emb
@@ -248,6 +249,13 @@ class FluxSingleTransformerBlock(nn.Module):
     @torch.compile
     def fuse_residual(self, proj_out, gate, hidden_states):
         return gate * proj_out + hidden_states
+
+    def fuse_projections(self):
+        self.qkv_mlp_linear = nn.Linear(3072, 3 * 3072 + self.mlp_hidden_dim, device="cuda", dtype=torch.bfloat16)
+        concatenated_weights = torch.cat([self.attn.to_qkv.weight, self.proj_mlp.weight])
+        concatenated_bias = torch.cat([self.attn.to_qkv.bias, self.proj_mlp.bias])
+        self.qkv_mlp_linear.weight.copy_(concatenated_weights)
+        self.qkv_mlp_linear.bias.copy_(concatenated_bias)
 
 
 
@@ -572,6 +580,11 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         for module in self.modules():
             if isinstance(module, Attention):
                 module.fuse_projections(fuse=True)
+
+        with torch.inference_mode():
+            for module in self.modules():
+                if isinstance(module, FluxSingleTransformerBlock):
+                    module.fuse_projections()
 
         self.set_attn_processor(FusedFluxAttnProcessor2_0())
 

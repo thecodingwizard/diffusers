@@ -235,14 +235,15 @@ def my_attention(
     hidden_states: torch.FloatTensor,
     image_rotary_emb: Tuple[torch.Tensor],
     out: torch.Tensor,
-    to_qkv=to_qkv,
+    qkv=None,
     norm_q=norm_q,
     norm_k=norm_k,
 ) -> torch.FloatTensor:
     batch_size, _, _ = hidden_states.shape
 
     # `sample` projections.
-    qkv = to_qkv(hidden_states)
+    if qkv is None:
+        qkv = to_qkv(hidden_states)
     split_size = qkv.shape[-1] // 3
     query, key, value = torch.split(qkv, split_size, dim=-1)
 
