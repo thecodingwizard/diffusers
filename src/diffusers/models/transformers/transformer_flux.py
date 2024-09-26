@@ -640,7 +640,8 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         if hasattr(module, "gradient_checkpointing"):
             module.gradient_checkpointing = value
 
-    def forward(
+    @torch.compile
+    def forward_compiled_section(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor = None,
@@ -655,33 +656,6 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         return_dict: bool = True,
         profile=False
     ) -> Union[torch.FloatTensor, Transformer2DModelOutput]:
-        """
-        The [`FluxTransformer2DModel`] forward method.
-
-        Args:
-            hidden_states (`torch.FloatTensor` of shape `(batch size, channel, height, width)`):
-                Input `hidden_states`.
-                Actually, I think this is batch x # patches x # channels?
-            encoder_hidden_states (`torch.FloatTensor` of shape `(batch size, sequence_len, embed_dims)`):
-                Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
-            pooled_projections (`torch.FloatTensor` of shape `(batch_size, projection_dim)`): Embeddings projected
-                from the embeddings of input conditions.
-            timestep ( `torch.LongTensor`):
-                Used to indicate denoising step.
-            block_controlnet_hidden_states: (`list` of `torch.Tensor`):
-                A list of tensors that if specified are added to the residuals of transformer blocks.
-            joint_attention_kwargs (`dict`, *optional*):
-                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
-                `self.processor` in
-                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
-                tuple.
-
-        Returns:
-            If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
-            `tuple` where the first element is the sample tensor.
-        """
         if joint_attention_kwargs is not None:
             joint_attention_kwargs = joint_attention_kwargs.copy()
             lora_scale = joint_attention_kwargs.pop("scale", 1.0)
@@ -763,50 +737,70 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
                 hidden_states = hidden_states + controlnet_block_samples[index_block // interval_control]
 
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        return hidden_states, temb, image_rotary_emb
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        pooled_projections: torch.Tensor = None,
+        timestep: torch.LongTensor = None,
+        img_ids: torch.Tensor = None,
+        txt_ids: torch.Tensor = None,
+        guidance: torch.Tensor = None,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        controlnet_block_samples=None,
+        controlnet_single_block_samples=None,
+        return_dict: bool = True,
+        profile=False
+    ) -> Union[torch.FloatTensor, Transformer2DModelOutput]:
+        """
+        The [`FluxTransformer2DModel`] forward method.
+
+        Args:
+            hidden_states (`torch.FloatTensor` of shape `(batch size, channel, height, width)`):
+                Input `hidden_states`.
+                Actually, I think this is batch x # patches x # channels?
+            encoder_hidden_states (`torch.FloatTensor` of shape `(batch size, sequence_len, embed_dims)`):
+                Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
+            pooled_projections (`torch.FloatTensor` of shape `(batch_size, projection_dim)`): Embeddings projected
+                from the embeddings of input conditions.
+            timestep ( `torch.LongTensor`):
+                Used to indicate denoising step.
+            block_controlnet_hidden_states: (`list` of `torch.Tensor`):
+                A list of tensors that if specified are added to the residuals of transformer blocks.
+            joint_attention_kwargs (`dict`, *optional*):
+                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
+                `self.processor` in
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
+                tuple.
+
+        Returns:
+            If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
+            `tuple` where the first element is the sample tensor.
+        """
+        hidden_states, temb, image_rotary_emb = self.forward_compiled_section(hidden_states, encoder_hidden_states, pooled_projections, timestep, img_ids, txt_ids, guidance, joint_attention_kwargs, controlnet_block_samples, controlnet_single_block_samples, return_dict)
 
         for index_block, block in enumerate(self.single_transformer_blocks):
-            if self.training and self.gradient_checkpointing:
-
-                def create_custom_forward(module, return_dict=None):
-                    def custom_forward(*inputs):
-                        if return_dict is not None:
-                            return module(*inputs, return_dict=return_dict)
-                        else:
-                            return module(*inputs)
-
-                    return custom_forward
-
-                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    hidden_states,
-                    temb,
-                    image_rotary_emb,
-                    **ckpt_kwargs,
-                )
-
-            else:
-                hidden_states = block(
-                    hidden_states=hidden_states,
-                    temb=temb,
-                    image_rotary_emb=image_rotary_emb,
-                )
-
-            # controlnet residual
-            if controlnet_single_block_samples is not None:
-                interval_control = len(self.single_transformer_blocks) / len(controlnet_single_block_samples)
-                interval_control = int(np.ceil(interval_control))
-                hidden_states[:, encoder_hidden_states.shape[1] :, ...] = (
-                    hidden_states[:, encoder_hidden_states.shape[1] :, ...]
-                    + controlnet_single_block_samples[index_block // interval_control]
-                )
+            hidden_states = block(
+                hidden_states=hidden_states,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+            )
 
         hidden_states = hidden_states[:, encoder_hidden_states.shape[1] :, ...]
-
+        return self.forward_end(hidden_states, temb, return_dict)
+        
+    
+    @torch.compile
+    def forward_end(self, hidden_states, temb, return_dict):
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
 
         if USE_PEFT_BACKEND:
+            assert False
             # remove `lora_scale` from each PEFT layer
             unscale_lora_layers(self, lora_scale)
 
