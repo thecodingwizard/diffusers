@@ -43,11 +43,11 @@ def gelu(
     
     return geglu_a
 
-def gelu_and_copy(a, b):
+@torch.library.custom_op("mylib::gelu_and_copy", mutates_args={"b"})
+def gelu_and_copy(a: torch.Tensor, b: torch.Tensor) -> None:
     gelu_and_copy_kernel[(a.shape[-2],)](
         a, b, a.shape[-1], a.stride(-2), b.stride(-2)
     )
-    return b
 
 
 if __name__ == "__main__":

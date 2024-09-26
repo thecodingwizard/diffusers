@@ -74,13 +74,14 @@ norm_q = RMSNorm(128, eps=1e-5).to("cuda").to(torch.bfloat16)
 norm_k = RMSNorm(128, eps=1e-5).to("cuda").to(torch.bfloat16)
 to_qkv = torch.nn.Linear(3072, 3072*3, device="cuda", dtype=torch.bfloat16)
 
-torch.library.define(
-    "mylib::flash_attn_with_out",
-    "(Tensor q, Tensor k, Tensor v, Tensor out) -> Tensor",
-)
+# torch.library.define(
+#     "mylib::flash_attn_with_out",
+#     "(Tensor q, Tensor k, Tensor v, Tensor out) -> Tensor",
+# )
 
-@torch.library.impl("mylib::flash_attn_with_out", "cuda")
-def custom_func(q, k, v, out):
+# @torch.library.impl("mylib::flash_attn_with_out", "cuda")
+@torch.library.custom_op("mylib::flash_attn_with_out", mutates_args={"out"})
+def custom_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor) -> None:
     assert q.stride(-1) == 1
     assert k.stride(-1) == 1
     assert v.stride(-1) == 1
@@ -101,11 +102,10 @@ def custom_func(q, k, v, out):
         window_size[0],
         window_size[1],
     )
-    return out
 
-@torch.library.register_fake("mylib::flash_attn_with_out")
-def custom_func_abstract(q, k, v, out):
-    return out
+# @torch.library.register_fake("mylib::flash_attn_with_out")
+# def custom_func_abstract(q, k, v, out):
+#     return out
 
 
 # @torch.compile
@@ -165,8 +165,7 @@ def _new_fused_qkv_rmsnorm_embed(
     X_ptr,
     X_stride_1,
     X_stride_2,
-    W_q_ptr,
-    W_k_ptr,
+    W_ptr,
     eps,
 
     freq_cos_ptr,
@@ -181,7 +180,7 @@ def _new_fused_qkv_rmsnorm_embed(
     3. https://arxiv.org/pdf/1910.07467
     """
 
-    n_heads: tl.constexpr = 24 * 2 # query, then key
+    n_heads: tl.constexpr = 24
     head_dim: tl.constexpr = 128
 
     row_idx = tl.program_id(0)
@@ -189,10 +188,8 @@ def _new_fused_qkv_rmsnorm_embed(
     mask = col_offsets < head_dim
 
     X_ptr += row_idx * X_stride_1
-    W_q_row = tl.load(W_q_ptr + col_offsets, mask=mask, other=0)
-    W_q_row = W_q_row.to(tl.float32)
-    W_k_row = tl.load(W_k_ptr + col_offsets, mask=mask, other=0)
-    W_k_row = W_k_row.to(tl.float32)
+    W_row = tl.load(W_ptr + col_offsets, mask=mask, other=0)
+    W_row = W_row.to(tl.float32)
 
     cos_first_half = tl.load(freq_cos_ptr + row_idx * 128 + tl.arange(0, head_dim // 2) * 2).to(tl.float32)
     cos_second_half = tl.load(freq_cos_ptr + row_idx * 128 + tl.arange(0, head_dim // 2) * 2 + 1).to(tl.float32)
@@ -211,7 +208,7 @@ def _new_fused_qkv_rmsnorm_embed(
 
         # lol ugh apparently llama does this calculation in bf16, but maybe f32 is OK?
         # X_row = X_row.to(tl.bfloat16)
-        Y_row = X_row * (W_q_row if i < 24 else W_k_row)
+        Y_row = X_row * W_row
 
         # tl.store(X_ptr + i * X_stride_2 + tl.arange(0, 128), Y_row.to(tl.float16))
         # --- ^ end RMS norm
@@ -230,6 +227,26 @@ def _new_fused_qkv_rmsnorm_embed(
         tl.store(X_ptr + i * X_stride_2 + tl.arange(0, head_dim//2) * 2, Y_first_half.to(tl.bfloat16))
         tl.store(X_ptr + i * X_stride_2 + tl.arange(0, head_dim//2) * 2 + 1, Y_second_half.to(tl.bfloat16))
 
+@torch.library.custom_op("mylib::fused_qkv_rmsnorm", mutates_args=["query", "key"])
+def fused_qkv_rmsnorm(query: torch.Tensor, key: torch.Tensor, norm_q: torch.Tensor, norm_k: torch.Tensor, img_1: torch.Tensor, img_2: torch.Tensor) -> None:
+    _new_fused_qkv_rmsnorm_embed[(query.shape[0],)](
+        query,
+        query.stride(0),
+        query.stride(1),
+        norm_q,
+        1e-6,
+        img_1,
+        img_2,
+    )
+    _new_fused_qkv_rmsnorm_embed[(query.shape[0],)](
+        key,
+        key.stride(0),
+        key.stride(1),
+        norm_k,
+        1e-6,
+        img_1,
+        img_2,
+    )
 
 def my_attention(
     hidden_states: torch.FloatTensor,
@@ -247,23 +264,14 @@ def my_attention(
     split_size = qkv.shape[-1] // 3
     query, key, value = torch.split(qkv, split_size, dim=-1)
 
-    inner_dim = key.shape[-1]
+    inner_dim = value.shape[-1]
     # n_heads = 24
     head_dim = inner_dim // 24
 
     query = query.view(-1, 24, head_dim)
     key = key.view(-1, 24, head_dim)
 
-    _new_fused_qkv_rmsnorm_embed[(query.shape[0],)](
-        query,
-        query.stride(0),
-        query.stride(1),
-        norm_q.weight,
-        norm_k.weight,
-        1e-6,
-        image_rotary_emb[0],
-        image_rotary_emb[1],
-    )
+    torch.ops.mylib.fused_qkv_rmsnorm(query, key, norm_q.weight, norm_k.weight, image_rotary_emb[0], image_rotary_emb[1])
 
     # [B, S, H, D]
     query = query.view(batch_size, -1, 24, head_dim)
@@ -271,8 +279,16 @@ def my_attention(
     value = value.view(batch_size, -1, 24, head_dim)
     out = out.view(batch_size, -1, 24, head_dim)
 
-    hidden_states = torch.ops.mylib.flash_attn_with_out(query, key, value, out)
-    hidden_states = hidden_states.reshape(batch_size, -1, 24 * head_dim)
+    # query = norm_q(query) # rms norm
+    # key = norm_k(key)
+    # query = apply_rotary_emb(query, image_rotary_emb)
+    # key = apply_rotary_emb(key, image_rotary_emb)
+
+    # hidden_states = torch.ops.mylib.custom_func(query, key, value)
+    # out.copy_(hidden_states)
+
+    torch.ops.mylib.flash_attn_with_out(query, key, value, out)
+    hidden_states = out.reshape(batch_size, -1, 24 * head_dim)
 
     return hidden_states
 

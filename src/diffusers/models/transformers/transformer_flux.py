@@ -108,6 +108,34 @@ def _modulation_kernel(
     tl.store(out_ptr + col_idx, out.to(tl.bfloat16))
 
 
+@torch.library.custom_op("mylib::modulation_kernel", mutates_args={"out"})
+def modulation_kernel(embed: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, out: torch.Tensor) -> None:
+    _modulation_kernel[(3072*3,)](
+        embed,
+        weight,
+        bias,
+        out,
+        BLOCK_SIZE=4096,
+        num_warps=8,
+    )
+
+@torch.library.custom_op("mylib::ln_forward", mutates_args={"actual_out"})
+def ln_forward_op(x: torch.Tensor, actual_out: torch.Tensor, shift_msa: torch.Tensor, scale_msa: torch.Tensor) -> None:
+    n_rows = x.shape[1]
+    dim = x.shape[-1]
+    _layer_norm_forward_kernel[(n_rows,)](
+        x,
+        x.stride(1), # since first dimension is empty
+        actual_out,
+        actual_out.stride(1), # since first dimension is empty
+        shift_msa,
+        scale_msa,
+        dim,
+        eps=1e-6,
+        BLOCK_SIZE=4096, # https://github.com/linkedin/Liger-Kernel/blob/main/src/liger_kernel/ops/utils.py
+        num_warps=8,
+    )
+
 
 class AdaLayerNormZeroSingle(nn.Module):
     r"""
@@ -143,31 +171,33 @@ class AdaLayerNormZeroSingle(nn.Module):
         x: torch.Tensor,
         emb: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        _modulation_kernel[(3072*3,)](
-            emb,
-            self.linear.weight,
-            self.linear.bias,
-            self.emb_out,
-            BLOCK_SIZE=4096,
-            num_warps=8,
-        )
+        torch.ops.mylib.modulation_kernel(emb, self.linear.weight, self.linear.bias, self.emb_out)
+        # _modulation_kernel[(3072*3,)](
+        #     emb,
+        #     self.linear.weight,
+        #     self.linear.bias,
+        #     self.emb_out,
+        #     BLOCK_SIZE=4096,
+        #     num_warps=8,
+        # )
 
         shift_msa, scale_msa, gate_msa = self.emb_out.chunk(3, dim=1)
 
-        n_rows = x.shape[1]
-        dim = x.shape[-1]
-        _layer_norm_forward_kernel[(n_rows,)](
-            x,
-            x.stride(1), # since first dimension is empty
-            self.actual_out,
-            self.actual_out.stride(1), # since first dimension is empty
-            shift_msa,
-            scale_msa,
-            dim,
-            eps=1e-6,
-            BLOCK_SIZE=4096, # https://github.com/linkedin/Liger-Kernel/blob/main/src/liger_kernel/ops/utils.py
-            num_warps=8,
-        )
+        # n_rows = x.shape[1]
+        # dim = x.shape[-1]
+        # _layer_norm_forward_kernel[(n_rows,)](
+        #     x,
+        #     x.stride(1), # since first dimension is empty
+        #     self.actual_out,
+        #     self.actual_out.stride(1), # since first dimension is empty
+        #     shift_msa,
+        #     scale_msa,
+        #     dim,
+        #     eps=1e-6,
+        #     BLOCK_SIZE=4096, # https://github.com/linkedin/Liger-Kernel/blob/main/src/liger_kernel/ops/utils.py
+        #     num_warps=8,
+        # )
+        torch.ops.mylib.ln_forward(x, self.actual_out, shift_msa, scale_msa)
         return self.actual_out, gate_msa
 
 
@@ -230,13 +260,17 @@ class FluxSingleTransformerBlock(nn.Module):
         # mlp_out.copy_(mlp_out_tmp) # temporary
         qkv_mlp = self.qkv_mlp_linear(norm_hidden_states)
         qkv, mlp_hidden_states = torch.split(qkv_mlp, [3 * 3072, self.mlp_hidden_dim], dim=-1)
-        triton_gelu_copy.gelu_and_copy(mlp_hidden_states, mlp_out)
+
+        # triton_gelu_copy.gelu_and_copy(mlp_hidden_states, mlp_out)
+
+        torch.ops.mylib.gelu_and_copy(mlp_hidden_states, mlp_out)
 
         triton_attn.my_attention(norm_hidden_states, image_rotary_emb, out=attn_out, qkv=qkv, norm_q = self.attn.norm_q, norm_k = self.attn.norm_k)
-        # attn_out = self.attn(
+        # attn_out_2 = self.attn(
         #     hidden_states=norm_hidden_states,
         #     image_rotary_emb=image_rotary_emb
         # )
+        # attn_out.copy_(attn_out_2)
 
         gate = gate.unsqueeze(1)
         hidden_states = self.fuse_residual(self.proj_out(attn_and_mlp_out), gate, residual)
