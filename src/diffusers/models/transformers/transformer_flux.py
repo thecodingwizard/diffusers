@@ -84,7 +84,8 @@ class FluxSingleTransformerBlock(nn.Module):
         self,
         hidden_states: torch.FloatTensor,
         temb: torch.FloatTensor,
-        image_rotary_emb=None,
+        emb_1: torch.Tensor,
+        emb_2: torch.Tensor,
     ):
         # start = torch.cuda.Event(enable_timing=True)
         # end = torch.cuda.Event(enable_timing=True)
@@ -95,7 +96,7 @@ class FluxSingleTransformerBlock(nn.Module):
 
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
-            image_rotary_emb=image_rotary_emb,
+            image_rotary_emb=(emb_1, emb_2),
         )
 
         hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)

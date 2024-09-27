@@ -1780,11 +1780,11 @@ class FluxAttnProcessor2_0:
             key = apply_rotary_emb(key, image_rotary_emb)
 
         # hidden_states = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
-        # hidden_states, _ = flash_attn_interface.flash_attn_func(query.transpose(1, 2), key.transpose(1, 2), value)
-        # hidden_states = hidden_states.transpose(1, 2)
-        hidden_states = torch.ops.mylib.custom_func(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2))
         # hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+
+        hidden_states = torch.ops.mylib.custom_func(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2))
         hidden_states = hidden_states.reshape(batch_size, -1, attn.heads * head_dim)
+
         hidden_states = hidden_states.to(query.dtype)
 
         if encoder_hidden_states is not None:
