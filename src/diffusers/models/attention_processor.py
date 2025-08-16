@@ -1703,7 +1703,7 @@ torch.library.define(
 
 @torch.library.impl("mylib::custom_func", "cuda")
 def custom_func(q, k, v):
-    hidden_states, _ = flash_attn_func(q, k, v)
+    hidden_states = flash_attn_func(q, k, v)
     return hidden_states
 
 @torch.library.register_fake("mylib::custom_func")
